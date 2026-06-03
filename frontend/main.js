@@ -80,7 +80,8 @@ async function initGraph() {
                  });
            }
         },
-        ...userConfig
+        ...userConfig,
+        simulationEnabled: false
       });
       
       graph.setPointPositions(positions);
