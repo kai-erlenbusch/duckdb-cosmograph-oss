@@ -42,14 +42,17 @@ static std::string EscapeJSON(const std::string &input) {
     return output;
 }
 
-static std::string SafeIdentifier(const std::string& id) {
-    if (id.find('(') != std::string::npos || id.find(' ') != std::string::npos) {
-        if (id.find(';') != std::string::npos) {
-            throw InvalidInputException("Invalid query/table string");
+static std::string WrapQuery(const std::string& query) {
+    std::string q = query;
+    q.erase(0, q.find_first_not_of(" \t\n\r"));
+    if (q.length() >= 6) {
+        std::string prefix = q.substr(0, 6);
+        for (char &c : prefix) c = std::toupper(c);
+        if (prefix == "SELECT" || prefix == "WITH  ") {
+            return "(" + query + ") AS __t";
         }
-        return id;
     }
-    return KeywordHelper::WriteOptionallyQuoted(id);
+    return "(SELECT * FROM " + query + ") AS __t";
 }
 
 static void HandleDataQueryBinary(const httplib::Request& req, const std::string& query, duckdb::shared_ptr<DatabaseInstance> db, httplib::Response &res) {
@@ -62,7 +65,7 @@ static void HandleDataQueryBinary(const httplib::Request& req, const std::string
     }
     
     Connection con(*db);
-    std::string query_safe = SafeIdentifier(query);
+    std::string query_safe = WrapQuery(query);
 
     auto check_res = con.Query("SELECT * FROM " + query_safe + " LIMIT 0;");
     if (check_res->HasError()) {
@@ -71,19 +74,21 @@ static void HandleDataQueryBinary(const httplib::Request& req, const std::string
         return;
     }
 
-    bool has_x = false, has_y = false, has_size = false, has_color = false;
+    bool has_x = false, has_y = false, has_size = false, has_color = false, has_id = false;
     for (auto& name : check_res->names) {
         if (name == "x") has_x = true;
         if (name == "y") has_y = true;
         if (name == "size") has_size = true;
         if (name == "color") has_color = true;
+        if (name == "id") has_id = true;
     }
 
     std::string sql = "SELECT ";
     sql += has_x ? "CAST(x AS REAL) AS x, " : "0.0::REAL AS x, ";
     sql += has_y ? "CAST(y AS REAL) AS y, " : "0.0::REAL AS y, ";
     sql += has_size ? "COALESCE(CAST(size AS REAL), 5.0) AS size, " : "5.0::REAL AS size, ";
-    sql += has_color ? "COALESCE(CAST(color AS VARCHAR), '') AS color " : "''::VARCHAR AS color ";
+    sql += has_color ? "COALESCE(CAST(color AS VARCHAR), '') AS color, " : "''::VARCHAR AS color, ";
+    sql += has_id ? "CAST(id AS UINTEGER) AS id " : "0::UINTEGER AS id ";
     sql += "FROM " + query_safe + " WHERE 1=1";
     if (has_x) sql += " AND x IS NOT NULL";
     if (has_y) sql += " AND y IS NOT NULL";
@@ -120,13 +125,10 @@ static void HandleDataQueryBinary(const httplib::Request& req, const std::string
     }
 
     std::string buffer;
-    buffer.resize(4 + total_rows * 16);
+    buffer.resize(4 + total_rows * 20); // 4 bytes header + 20 bytes per row (5 properties)
     char* out_ptr = &buffer[0];
     *reinterpret_cast<uint32_t*>(out_ptr) = total_rows;
-    float* x_out = reinterpret_cast<float*>(out_ptr + 4);
-    float* y_out = reinterpret_cast<float*>(out_ptr + 4 + total_rows * 4);
-    float* size_out = reinterpret_cast<float*>(out_ptr + 4 + total_rows * 8);
-    float* color_out = reinterpret_cast<float*>(out_ptr + 4 + total_rows * 12);
+    char* data_ptr = out_ptr + 4;
 
     auto result = con.SendQuery(sql + ";");
     if (result->HasError()) {
@@ -150,12 +152,15 @@ static void HandleDataQueryBinary(const httplib::Request& req, const std::string
         auto size_data = FlatVector::GetData<float>(chunk->data[2]);
         auto color_data = FlatVector::GetData<string_t>(chunk->data[3]);
         auto& color_validity = FlatVector::Validity(chunk->data[3]);
+        auto id_data = FlatVector::GetData<uint32_t>(chunk->data[4]);
 
         for (idx_t i = 0; i < count; i++) {
             if (current_row >= total_rows) break;
-            x_out[current_row] = x_data[i];
-            y_out[current_row] = y_data[i];
-            size_out[current_row] = size_data[i];
+            
+            float x_val = x_data[i];
+            float y_val = y_data[i];
+            float size_val = size_data[i];
+            uint32_t id_val = id_data[i];
             
             std::string c_str = "";
             if (color_validity.RowIsValid(i)) {
@@ -164,27 +169,25 @@ static void HandleDataQueryBinary(const httplib::Request& req, const std::string
             if (color_map.find(c_str) == color_map.end()) {
                 color_map[c_str] = current_color++;
             }
-            color_out[current_row] = color_map[c_str];
+            float color_val = color_map[c_str];
+
+            // Interleaved packing
+            char* row_ptr = data_ptr + (current_row * 20);
+            *reinterpret_cast<float*>(row_ptr) = x_val;
+            *reinterpret_cast<float*>(row_ptr + 4) = y_val;
+            *reinterpret_cast<float*>(row_ptr + 8) = size_val;
+            *reinterpret_cast<float*>(row_ptr + 12) = color_val;
+            *reinterpret_cast<uint32_t*>(row_ptr + 16) = id_val;
+
             current_row++;
         }
     }
 
-    // Shrink if we processed less rows (due to bounds or concurrency)
+    // Shrink if we processed less rows (due to concurrent deletes or boundaries)
+    // Because the format is interleaved, this is zero-copy! We just truncate the string.
     if (current_row < total_rows) {
         *reinterpret_cast<uint32_t*>(out_ptr) = current_row;
-        // Compacting is complex in this columnar format without extra memory.
-        // It's safer to just let Cosmograph read up to current_row if we patch its parsing logic,
-        // but our flat memory layout assumes consecutive arrays. 
-        // We will just do a standard buffer rebuild if it shrunk to avoid corrupted data.
-        std::string shrink_buf;
-        shrink_buf.resize(4 + current_row * 16);
-        char* sh_ptr = &shrink_buf[0];
-        *reinterpret_cast<uint32_t*>(sh_ptr) = current_row;
-        memcpy(sh_ptr + 4, x_out, current_row * 4);
-        memcpy(sh_ptr + 4 + current_row * 4, y_out, current_row * 4);
-        memcpy(sh_ptr + 4 + current_row * 8, size_out, current_row * 4);
-        memcpy(sh_ptr + 4 + current_row * 12, color_out, current_row * 4);
-        buffer = std::move(shrink_buf);
+        buffer.resize(4 + current_row * 20);
     }
 
     res.set_header("Cache-Control", "no-cache, no-store, must-revalidate");
@@ -198,7 +201,7 @@ static void HandleDataQuery(const httplib::Request& req, const std::string& quer
     }
     
     Connection con(*db);
-    std::string query_safe = SafeIdentifier(query);
+    std::string query_safe = WrapQuery(query);
     std::string sql = "SELECT * FROM " + query_safe;
 
     if (is_nodes) {
@@ -326,19 +329,29 @@ inline void ServeGraphFun(DataChunk &args, ExpressionState &state, Vector &resul
     });
 
     g_server->Get("/node_details", [db, nodes_query](const httplib::Request &req, httplib::Response &res) {
-        if (!req.has_param("id")) {
+        bool has_id_val = req.has_param("id_val");
+        if (!req.has_param("id") && !has_id_val) {
             res.status = 400; res.set_content("[]", "application/json"); return;
         }
         
-        uint64_t id_val;
+        uint64_t target_val;
         try {
-            id_val = std::stoull(req.get_param_value("id"));
+            if (has_id_val) {
+                target_val = std::stoull(req.get_param_value("id_val"));
+            } else {
+                target_val = std::stoull(req.get_param_value("id"));
+            }
         } catch (...) {
             res.status = 400; res.set_content("Invalid id parameter", "text/plain"); return;
         }
 
         Connection con(*db);
-            std::string sql = "SELECT * FROM " + SafeIdentifier(nodes_query) + " LIMIT 1 OFFSET " + std::to_string(id_val) + ";";
+            std::string sql;
+            if (has_id_val) {
+                sql = "SELECT * FROM " + WrapQuery(nodes_query) + " WHERE id = " + std::to_string(target_val) + " LIMIT 1;";
+            } else {
+                sql = "SELECT * FROM " + WrapQuery(nodes_query) + " LIMIT 1 OFFSET " + std::to_string(target_val) + ";";
+            }
             auto result = con.Query(sql);
             if (result->HasError()) {
                 res.status = 500;

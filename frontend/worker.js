@@ -18,6 +18,11 @@ function hexToRGBA(hex) {
 
 self.onmessage = async (e) => {
   try {
+    const configRes = await fetch(self.location.origin + '/config');
+    const configObj = await configRes.json();
+    const config = configObj.config || {};
+    const defaultScale = config.spatialScale || 1.0;
+
     let url = self.location.origin + '/data/nodes_binary';
     const bounds = e.data.bounds;
     if (bounds) {
@@ -37,49 +42,66 @@ self.onmessage = async (e) => {
       return;
     }
 
-    const xArr = new Float32Array(buf, 4, count);
-    const yArr = new Float32Array(buf, 4 + count * 4, count);
-    const rawSizeArr = new Float32Array(buf, 4 + count * 8, count);
-    const rawColorArr = new Float32Array(buf, 4 + count * 12, count);
-
-    let minSize = Infinity, maxSize = -Infinity;
-    let minX = Infinity, maxX = -Infinity, minY = Infinity, maxY = -Infinity;
-    for (let i = 0; i < count; i++) {
-       if (rawSizeArr[i] < minSize) minSize = rawSizeArr[i];
-       if (rawSizeArr[i] > maxSize) maxSize = rawSizeArr[i];
-       if (xArr[i] < minX) minX = xArr[i];
-       if (xArr[i] > maxX) maxX = xArr[i];
-       if (yArr[i] < minY) minY = yArr[i];
-       if (yArr[i] > maxY) maxY = yArr[i];
-    }
-    const logMin = Math.log1p(Math.max(0, minSize));
-    const logMax = Math.log1p(Math.max(0, maxSize));
-    
-    const rangeX = maxX - minX || 1;
-    const rangeY = maxY - minY || 1;
-    const scale = Math.max(rangeX, rangeY);
-
     const positions = new Float32Array(count * 2);
     const sizes = new Float32Array(count);
     const colors = new Float32Array(count * 4);
+    const ids = new Uint32Array(count);
 
+    let minSize = Infinity, maxSize = -Infinity;
+    let minX = Infinity, maxX = -Infinity, minY = Infinity, maxY = -Infinity;
+
+    // First pass: Calculate bounds for dynamic scaling
     for (let i = 0; i < count; i++) {
-      positions[i * 2] = xArr[i] * 40;
-      positions[i * 2 + 1] = yArr[i] * 40;
+       const offset = 4 + (i * 20);
+       const x = dv.getFloat32(offset, true);
+       const y = dv.getFloat32(offset + 4, true);
+       const s = dv.getFloat32(offset + 8, true);
 
-      let t = logMax > logMin ? (Math.log1p(Math.max(0, rawSizeArr[i])) - logMin) / (logMax - logMin) : 0;
-      sizes[i] = 1 + t * 2;
+       if (s < minSize) minSize = s;
+       if (s > maxSize) maxSize = s;
+       if (x < minX) minX = x;
+       if (x > maxX) maxX = x;
+       if (y < minY) minY = y;
+       if (y > maxY) maxY = y;
+    }
 
-      const cat = Math.floor(rawColorArr[i]);
+    const logMin = Math.log1p(Math.max(0, minSize));
+    const logMax = Math.log1p(Math.max(0, maxSize));
+    
+    // Auto scale if they provided absolute coordinates
+    const rangeX = maxX - minX || 1;
+    const rangeY = maxY - minY || 1;
+    const spatialRange = Math.max(rangeX, rangeY);
+    // If the data is e.g. 0-1, we want to scale it to ~1000 so Cosmograph physics look good
+    const autoScale = (spatialRange > 0 && spatialRange < 10) ? (1000.0 / spatialRange) : 1.0;
+    const finalScale = autoScale * defaultScale;
+
+    // Second pass: Populate arrays
+    for (let i = 0; i < count; i++) {
+      const offset = 4 + (i * 20);
+      const x = dv.getFloat32(offset, true);
+      const y = dv.getFloat32(offset + 4, true);
+      const s = dv.getFloat32(offset + 8, true);
+      const cat = Math.floor(dv.getFloat32(offset + 12, true));
+      const id = dv.getUint32(offset + 16, true);
+
+      positions[i * 2] = x * finalScale;
+      positions[i * 2 + 1] = y * finalScale;
+
+      let t = logMax > logMin ? (Math.log1p(Math.max(0, s)) - logMin) / (logMax - logMin) : 0;
+      sizes[i] = config.minNodeSize || 1 + t * (config.maxNodeSize || 2);
+
       const hex = getCategoryColor(cat);
       const [r, g, b, a] = hexToRGBA(hex);
       colors[i * 4] = r;
       colors[i * 4 + 1] = g;
       colors[i * 4 + 2] = b;
       colors[i * 4 + 3] = a;
+
+      ids[i] = id;
     }
     
-    self.postMessage({ count, positions, sizes, colors }, [positions.buffer, sizes.buffer, colors.buffer]);
+    self.postMessage({ count, positions, sizes, colors, ids }, [positions.buffer, sizes.buffer, colors.buffer, ids.buffer]);
   } catch(err) {
     self.postMessage({ error: err.message });
   }

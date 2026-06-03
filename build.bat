@@ -1,7 +1,10 @@
-call "C:\Program Files (x86)\Microsoft Visual Studio\18\BuildTools\VC\Auxiliary\Build\vcvars64.bat"
-cd /d D:\exploratory\duckdb-extension\duckdb-cosmograph-oss\frontend
-call npx vite build
+@echo off
+call "C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Auxiliary\Build\vcvars64.bat"
+cd D:\exploratory\duckdb-extension\duckdb-cosmograph-oss
+cd frontend
+call npm install
+call npm run build
 cd ..
 node scripts/embed_assets.js
-cmake -B build/release -DCMAKE_BUILD_TYPE=Release
-cmake --build build/release --config Release
+cmake -B build -S .
+cmake --build build --config Release

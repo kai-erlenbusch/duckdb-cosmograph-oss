@@ -38,8 +38,10 @@ async function initGraph() {
         return;
       }
 
-      const { count, positions, sizes, colors } = e.data;
+      const { count, positions, sizes, colors, ids } = e.data;
       loading.style.display = 'none';
+
+      let useIds = ids && ids.some(val => val !== 0);
 
       graph = new Graph(canvas, {
         pixelRatio: 1, 
@@ -55,7 +57,12 @@ async function initGraph() {
                tooltip.style.display = 'block';
                content.innerText = 'Loading DuckDB data for node ' + index + '...';
 
-               fetch('/node_details?id=' + encodeURIComponent(index))
+               let queryParam = useIds ? 'id_val=' + ids[index] : 'id=' + index;
+               if (!useIds) {
+                   console.warn("No 'id' column found in query. Using OFFSET index which may be non-deterministic.");
+               }
+
+               fetch('/node_details?' + queryParam)
                  .then(async r => {
                    if (!r.ok) throw new Error(await r.text());
                    return r.json();
