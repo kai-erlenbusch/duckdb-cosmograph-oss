@@ -1,0 +1,23 @@
+# name: test/sql/cosmograph.test
+__REPLACEMENT_DONE__# description: test cosmograph extension
+__REPLACEMENT_DONE__# group: [sql]
+
+# Before we load the extension, this will fail
+statement error
+SELECT cosmograph('Sam');
+__REPLACEMENT_DONE__----
+Catalog Error: Scalar Function with name cosmograph does not exist!
+__REPLACEMENT_DONE__
+# Require statement will ensure this test is run with this extension loaded
+require cosmograph
+__REPLACEMENT_DONE__
+# Confirm the extension works
+query I
+SELECT cosmograph('Sam');
+__REPLACEMENT_DONE__----
+...........🦆 Sam
+
+query I
+SELECT cosmograph_openssl_version('Michael') ILIKE 'Cosmograph Michael, my linked OpenSSL version is OpenSSL%';
+__REPLACEMENT_DONE__----
+true
