@@ -1,5 +1,8 @@
 import { Graph } from '@cosmos.gl/graph';
 
+const urlParams = new URLSearchParams(window.location.search);
+const token = urlParams.get('token');
+
 const canvas = document.getElementById('app');
 const loading = document.getElementById('loading');
 
@@ -10,15 +13,19 @@ let currentEdges = undefined;
 
 async function initGraph() {
   try {
-    const configRes = await fetch('/config').then(r => r.json());
+    const configRes = await fetch(`/config?token=${token}`).then(r => r.json());
     const userConfig = configRes.config || {};
     
-    const rawEdges = await fetch('/data/edges').then(r => r.json());
-    if (rawEdges && rawEdges.source && rawEdges.target) {
+    const rawEdges = await fetch(`/data/edges?token=${token}`).then(r => r.json());
+    if (rawEdges && rawEdges.length > 0) {
+        currentEdges = new Float32Array(rawEdges.length * 2);
+        for (let i = 0; i < rawEdges.length; i++) {
+            currentEdges[i*2] = Number(rawEdges[i].source);
+            currentEdges[i*2+1] = Number(rawEdges[i].target);
+        }
+    } else if (rawEdges && rawEdges.source && rawEdges.target) {
         currentEdges = new Float32Array(rawEdges.source.length * 2);
         for (let i = 0; i < rawEdges.source.length; i++) {
-            // NOTE: @cosmos.gl/graph expects zero-based INDICES into the points array!
-            // Assuming for now that the edge source/target are already zero-based indices.
             currentEdges[i*2] = Number(rawEdges.source[i]);
             currentEdges[i*2+1] = Number(rawEdges.target[i]);
         }
@@ -56,7 +63,7 @@ async function initGraph() {
                    console.warn("No 'id' column found in query. Using OFFSET index which may be non-deterministic.");
                }
 
-               fetch('/node_details?' + queryParam)
+               fetch(`/node_details?${queryParam}&token=${token}`)
                  .then(async r => {
                    if (!r.ok) throw new Error(await r.text());
                    return r.json();
@@ -100,7 +107,7 @@ async function initGraph() {
 
     };
 
-    worker.postMessage({ bounds: null });
+    worker.postMessage({ bounds: null, token: token });
 
   } catch(err) {
     loading.innerText = 'Error loading graph: ' + err.message;

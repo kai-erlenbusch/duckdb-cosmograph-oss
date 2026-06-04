@@ -16,6 +16,7 @@
 #include <thread>
 #include <mutex>
 #include <memory>
+#include <random>
 
 #include "duckdb/execution/expression_executor_state.hpp"
 #include "duckdb/main/client_context.hpp"
@@ -23,8 +24,22 @@
 
 namespace duckdb {
 
-static std::unique_ptr<httplib::Server> g_server = nullptr;
-static std::unique_ptr<std::thread> g_server_thread = nullptr;
+struct ServerState {
+    std::unique_ptr<httplib::Server> server;
+    std::unique_ptr<std::thread> thread;
+    std::string token;
+    
+    ~ServerState() {
+        if (server) {
+            server->stop();
+        }
+        if (thread && thread->joinable()) {
+            thread->join();
+        }
+    }
+};
+
+static ServerState g_state;
 static std::mutex g_server_mutex;
 
 static std::string EscapeJSON(const std::string &input) {
@@ -124,12 +139,6 @@ static void HandleDataQueryBinary(const httplib::Request& req, const std::string
         return;
     }
 
-    std::string buffer;
-    buffer.resize(4 + total_rows * 20); // 4 bytes header + 20 bytes per row (5 properties)
-    char* out_ptr = &buffer[0];
-    *reinterpret_cast<uint32_t*>(out_ptr) = total_rows;
-    char* data_ptr = out_ptr + 4;
-
     auto result = con.SendQuery(sql + ";");
     if (result->HasError()) {
         res.status = 500;
@@ -137,61 +146,91 @@ static void HandleDataQueryBinary(const httplib::Request& req, const std::string
         return;
     }
 
-    std::unordered_map<std::string, float> color_map;
-    float current_color = 0.0f;
-    uint32_t current_row = 0;
-
-    while (true) {
-        auto chunk = result->Fetch();
-        if (!chunk || chunk->size() == 0) break;
-        chunk->Flatten();
-        idx_t count = chunk->size();
-        
-        auto x_data = FlatVector::GetData<float>(chunk->data[0]);
-        auto y_data = FlatVector::GetData<float>(chunk->data[1]);
-        auto size_data = FlatVector::GetData<float>(chunk->data[2]);
-        auto color_data = FlatVector::GetData<string_t>(chunk->data[3]);
-        auto& color_validity = FlatVector::Validity(chunk->data[3]);
-        auto id_data = FlatVector::GetData<uint32_t>(chunk->data[4]);
-
-        for (idx_t i = 0; i < count; i++) {
-            if (current_row >= total_rows) break;
-            
-            float x_val = x_data[i];
-            float y_val = y_data[i];
-            float size_val = size_data[i];
-            uint32_t id_val = id_data[i];
-            
-            std::string c_str = "";
-            if (color_validity.RowIsValid(i)) {
-                c_str = color_data[i].GetString();
-            }
-            if (color_map.find(c_str) == color_map.end()) {
-                color_map[c_str] = current_color++;
-            }
-            float color_val = color_map[c_str];
-
-            // Interleaved packing
-            char* row_ptr = data_ptr + (current_row * 20);
-            *reinterpret_cast<float*>(row_ptr) = x_val;
-            *reinterpret_cast<float*>(row_ptr + 4) = y_val;
-            *reinterpret_cast<float*>(row_ptr + 8) = size_val;
-            *reinterpret_cast<float*>(row_ptr + 12) = color_val;
-            *reinterpret_cast<uint32_t*>(row_ptr + 16) = id_val;
-
-            current_row++;
-        }
-    }
-
-    // Shrink if we processed less rows (due to concurrent deletes or boundaries)
-    // Because the format is interleaved, this is zero-copy! We just truncate the string.
-    if (current_row < total_rows) {
-        *reinterpret_cast<uint32_t*>(out_ptr) = current_row;
-        buffer.resize(4 + current_row * 20);
-    }
+    std::shared_ptr<QueryResult> result_shared = std::move(result);
+    auto total_rows_shared = std::make_shared<uint32_t>(total_rows);
+    auto color_map_shared = std::make_shared<std::unordered_map<std::string, float>>();
+    auto current_color_shared = std::make_shared<float>(0.0f);
+    auto current_row_shared = std::make_shared<uint32_t>(0);
+    auto header_written_shared = std::make_shared<bool>(false);
 
     res.set_header("Cache-Control", "no-cache, no-store, must-revalidate");
-    res.set_content(buffer, "application/octet-stream");
+    res.set_content_provider(
+        "application/octet-stream",
+        [result_shared, total_rows_shared, color_map_shared, current_color_shared, current_row_shared, header_written_shared](size_t offset, httplib::DataSink &sink) mutable {
+            if (!result_shared) {
+                sink.done();
+                return true;
+            }
+
+            if (!*header_written_shared) {
+                uint32_t tr = *total_rows_shared;
+                sink.write(reinterpret_cast<const char*>(&tr), 4);
+                *header_written_shared = true;
+            }
+            
+            auto chunk = result_shared->Fetch();
+            if (!chunk || chunk->size() == 0) {
+                result_shared.reset();
+                sink.done();
+                return true;
+            }
+            
+            chunk->Flatten();
+            idx_t count = chunk->size();
+            
+            auto x_data = FlatVector::GetData<float>(chunk->data[0]);
+            auto y_data = FlatVector::GetData<float>(chunk->data[1]);
+            auto size_data = FlatVector::GetData<float>(chunk->data[2]);
+            auto color_data = FlatVector::GetData<string_t>(chunk->data[3]);
+            auto& color_validity = FlatVector::Validity(chunk->data[3]);
+            auto id_data = FlatVector::GetData<uint32_t>(chunk->data[4]);
+
+            std::string local_buf;
+            local_buf.resize(count * 20);
+            char* data_ptr = &local_buf[0];
+            
+            uint32_t local_count = 0;
+
+            for (idx_t i = 0; i < count; i++) {
+                if (*current_row_shared >= *total_rows_shared) break;
+                
+                float x_val = x_data[i];
+                float y_val = y_data[i];
+                float size_val = size_data[i];
+                uint32_t id_val = id_data[i];
+                
+                std::string c_str = "";
+                if (color_validity.RowIsValid(i)) {
+                    c_str = color_data[i].GetString();
+                }
+                if (color_map_shared->find(c_str) == color_map_shared->end()) {
+                    (*color_map_shared)[c_str] = (*current_color_shared)++;
+                }
+                float color_val = (*color_map_shared)[c_str];
+
+                // Interleaved packing
+                char* row_ptr = data_ptr + (local_count * 20);
+                *reinterpret_cast<float*>(row_ptr) = x_val;
+                *reinterpret_cast<float*>(row_ptr + 4) = y_val;
+                *reinterpret_cast<float*>(row_ptr + 8) = size_val;
+                *reinterpret_cast<float*>(row_ptr + 12) = color_val;
+                *reinterpret_cast<uint32_t*>(row_ptr + 16) = id_val;
+
+                local_count++;
+                (*current_row_shared)++;
+            }
+            
+            if (local_count > 0) {
+                sink.write(data_ptr, local_count * 20);
+            }
+            
+            if (*current_row_shared >= *total_rows_shared) {
+                result_shared.reset();
+                sink.done();
+            }
+            return true;
+        }
+    );
 }
 
 static void HandleDataQuery(const httplib::Request& req, const std::string& query, duckdb::shared_ptr<DatabaseInstance> db, httplib::Response &res, bool is_nodes) {
@@ -232,38 +271,74 @@ static void HandleDataQuery(const httplib::Request& req, const std::string& quer
         }
     }
 
-    auto result = con.Query(sql + ";");
+    auto result = con.SendQuery(sql + ";");
     if (result->HasError()) {
         res.status = 500;
         res.set_content(result->GetErrorObject().Message(), "text/plain");
         return;
     }
 
-    std::string json;
-    json.reserve(result->RowCount() * result->ColumnCount() * 20);
-    json = "{";
-    for (idx_t col_idx = 0; col_idx < result->ColumnCount(); col_idx++) {
-        if (col_idx > 0) json += ",";
-        json += "\"" + EscapeJSON(result->names[col_idx]) + "\":[";
-        for (idx_t row_idx = 0; row_idx < result->RowCount(); row_idx++) {
-            if (row_idx > 0) json += ",";
-            Value val = result->GetValue(col_idx, row_idx);
-            if (val.IsNull()) {
-                json += "null";
-            } else if (val.type().IsNumeric()) {
-                json += val.ToString();
-            } else if (val.type().id() == LogicalTypeId::BOOLEAN) {
-                json += val.GetValue<bool>() ? "true" : "false";
-            } else {
-                json += "\"" + EscapeJSON(val.ToString()) + "\"";
-            }
-        }
-        json += "]";
-    }
-    json += "}";
-    
+    std::shared_ptr<QueryResult> result_shared = std::move(result);
+    auto first_chunk_shared = std::make_shared<bool>(true);
+
     res.set_header("Cache-Control", "no-cache, no-store, must-revalidate");
-    res.set_content(json, "application/json");
+    res.set_content_provider(
+        "application/json",
+        [result_shared, first_chunk_shared](size_t offset, httplib::DataSink &sink) mutable {
+            if (!result_shared) {
+                sink.done();
+                return true;
+            }
+
+            if (*first_chunk_shared) {
+                sink.write("[", 1);
+            }
+            
+            auto chunk = result_shared->Fetch();
+            if (!chunk || chunk->size() == 0) {
+                if (*first_chunk_shared) {
+                    sink.write("]", 1);
+                } else {
+                    sink.write("\n]", 2);
+                }
+                result_shared.reset();
+                sink.done();
+                return true;
+            }
+
+            chunk->Flatten();
+            idx_t count = chunk->size();
+            std::string local_buf;
+            
+            for (idx_t i = 0; i < count; i++) {
+                if (*first_chunk_shared && i == 0) {
+                    local_buf += "\n  {";
+                } else {
+                    local_buf += ",\n  {";
+                }
+                
+                for (idx_t col_idx = 0; col_idx < result_shared->names.size(); col_idx++) {
+                    if (col_idx > 0) local_buf += ",";
+                    local_buf += "\"" + EscapeJSON(result_shared->names[col_idx]) + "\":";
+                    Value val = chunk->GetValue(col_idx, i);
+                    if (val.IsNull()) {
+                        local_buf += "null";
+                    } else if (val.type().IsNumeric()) {
+                        local_buf += val.ToString();
+                    } else if (val.type().id() == LogicalTypeId::BOOLEAN) {
+                        local_buf += val.GetValue<bool>() ? "true" : "false";
+                    } else {
+                        local_buf += "\"" + EscapeJSON(val.ToString()) + "\"";
+                    }
+                }
+                local_buf += "}";
+            }
+            
+            sink.write(local_buf.data(), local_buf.length());
+            *first_chunk_shared = false;
+            return true;
+        }
+    );
 }
 
 inline void ServeGraphFun(DataChunk &args, ExpressionState &state, Vector &result) {
@@ -286,49 +361,68 @@ inline void ServeGraphFun(DataChunk &args, ExpressionState &state, Vector &resul
     auto db = state.GetContext().db;
 
     std::lock_guard<std::mutex> lock(g_server_mutex);
-    if (g_server) {
+    if (g_state.server) {
         for (idx_t i = 0; i < args.size(); i++) {
             result.SetValue(i, Value("Server is already running. Please SELECT stop_graph() first."));
         }
         return;
     }
 
-    g_server = duckdb::make_uniq<httplib::Server>();
+    std::random_device rd;
+    std::mt19937_64 gen(rd());
+    std::uniform_int_distribution<uint64_t> dis;
+    std::string token = std::to_string(dis(gen)) + std::to_string(dis(gen));
+    g_state.token = token;
+
+    g_state.server = duckdb::make_uniq<httplib::Server>();
+
+    g_state.server->set_pre_routing_handler([](const httplib::Request &req, httplib::Response &res) {
+        if (req.path.find("/data/") == 0 || req.path == "/config" || req.path == "/node_details") {
+            std::string auth_header = req.get_header_value("Authorization");
+            std::string req_token = req.get_param_value("token");
+            if (req_token != g_state.token && auth_header != "Bearer " + g_state.token) {
+                res.status = 401;
+                res.set_content("Unauthorized", "text/plain");
+                return httplib::Server::HandlerResponse::Handled;
+            }
+        }
+        return httplib::Server::HandlerResponse::Unhandled;
+    });
 
     auto assets = duckdb::web_assets::get_assets();
     for (const auto& kv : assets) {
         std::string path = kv.first;
         if (path == "/index.html") {
-             g_server->Get("/", [kv](const httplib::Request &, httplib::Response &res) {
+             g_state.server->Get("/", [kv](const httplib::Request &, httplib::Response &res) {
                  res.set_content(reinterpret_cast<const char*>(kv.second.data), kv.second.size, kv.second.content_type);
                  res.set_header("Cache-Control", "no-cache, no-store, must-revalidate");
              });
         }
-        g_server->Get(path, [kv](const httplib::Request &, httplib::Response &res) {
+        g_state.server->Get(path, [kv](const httplib::Request &, httplib::Response &res) {
              res.set_content(reinterpret_cast<const char*>(kv.second.data), kv.second.size, kv.second.content_type);
              res.set_header("Cache-Control", "no-cache, no-store, must-revalidate");
         });
     }
 
-    g_server->Get("/config", [config_json](const httplib::Request &, httplib::Response &res) {
+    g_state.server->Get("/config", [config_json](const httplib::Request &, httplib::Response &res) {
         std::string json = "{\"config\": " + (config_json.empty() ? "{}" : config_json) + "}";
         res.set_content(json, "application/json");
         res.set_header("Cache-Control", "no-cache, no-store, must-revalidate");
     });
 
-    g_server->Get("/data/nodes", [db, nodes_query](const httplib::Request &req, httplib::Response &res) {
+    g_state.server->Get("/data/nodes", [db, nodes_query](const httplib::Request &req, httplib::Response &res) {
         HandleDataQuery(req, nodes_query, db, res, true);
     });
 
-    g_server->Get("/data/nodes_binary", [db, nodes_query](const httplib::Request &req, httplib::Response &res) {
+    g_state.server->Get("/data/nodes_binary", [db, nodes_query](const httplib::Request &req, httplib::Response &res) {
         HandleDataQueryBinary(req, nodes_query, db, res);
     });
 
-    g_server->Get("/data/edges", [db, edges_query](const httplib::Request &req, httplib::Response &res) {
+    g_state.server->Get("/data/edges", [db, edges_query](const httplib::Request &req, httplib::Response &res) {
         HandleDataQuery(req, edges_query, db, res, false);
     });
 
-    g_server->Get("/node_details", [db, nodes_query](const httplib::Request &req, httplib::Response &res) {
+    g_state.server->Get("/node_details", [db, nodes_query](const httplib::Request &req, httplib::Response &res) {
         bool has_id_val = req.has_param("id_val");
         if (!req.has_param("id") && !has_id_val) {
             res.status = 400; res.set_content("[]", "application/json"); return;
@@ -382,43 +476,43 @@ inline void ServeGraphFun(DataChunk &args, ExpressionState &state, Vector &resul
             res.set_content(json, "application/json");
     });
 
-    g_server->Get("/stop", [&](const httplib::Request &, httplib::Response &res) {
+    g_state.server->Get("/stop", [&](const httplib::Request &, httplib::Response &res) {
         res.set_content("Please run SELECT stop_graph(); in your DuckDB client to stop the server.", "text/plain");
     });
 
     int port = 8080;
-    while (!g_server->bind_to_port("127.0.0.1", port)) {
+    while (!g_state.server->bind_to_port("127.0.0.1", port)) {
         port++;
         if (port > 8090) {
             for (idx_t i = 0; i < args.size(); i++) {
                 result.SetValue(i, Value("Failed to bind to any port between 8080 and 8090."));
             }
-            g_server.reset();
+            g_state.server.reset();
             return;
         }
     }
     
-    std::cout << "Starting Cosmograph Server on http://127.0.0.1:" << port << std::endl;
+    std::cout << "Starting Cosmograph Server on http://127.0.0.1:" << port << "/?token=" << token << std::endl;
     std::cout << "Run SELECT stop_graph(); in DuckDB to kill the server." << std::endl;
     
-    g_server_thread = duckdb::make_uniq<std::thread>([]() {
-        g_server->listen_after_bind();
+    g_state.thread = duckdb::make_uniq<std::thread>([]() {
+        g_state.server->listen_after_bind();
     });
 
     for (idx_t i = 0; i < args.size(); i++) {
-        result.SetValue(i, Value("Cosmograph running at http://127.0.0.1:" + std::to_string(port)));
+        result.SetValue(i, Value("Cosmograph running at http://127.0.0.1:" + std::to_string(port) + "/?token=" + token));
     }
 }
 
 static void StopGraphFun(DataChunk &args, ExpressionState &state, Vector &result) {
     std::lock_guard<std::mutex> lock(g_server_mutex);
-    if (g_server) {
-        g_server->stop();
-        if (g_server_thread && g_server_thread->joinable()) {
-            g_server_thread->join();
+    if (g_state.server) {
+        g_state.server->stop();
+        if (g_state.thread && g_state.thread->joinable()) {
+            g_state.thread->join();
         }
-        g_server.reset();
-        g_server_thread.reset();
+        g_state.server.reset();
+        g_state.thread.reset();
         for (idx_t i = 0; i < args.size(); i++) {
             result.SetValue(i, Value("Server stopped gracefully."));
         }

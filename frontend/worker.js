@@ -18,15 +18,16 @@ function hexToRGBA(hex) {
 
 self.onmessage = async (e) => {
   try {
-    const configRes = await fetch(self.location.origin + '/config');
+    const token = e.data.token;
+    const configRes = await fetch(self.location.origin + `/config?token=${token}`);
     const configObj = await configRes.json();
     const config = configObj.config || {};
     const defaultScale = config.spatialScale || 1.0;
 
-    let url = self.location.origin + '/data/nodes_binary';
+    let url = self.location.origin + `/data/nodes_binary?token=${token}`;
     const bounds = e.data.bounds;
     if (bounds) {
-      url += "?min_x=" + bounds.min_x + "&max_x=" + bounds.max_x + "&min_y=" + bounds.min_y + "&max_y=" + bounds.max_y;
+      url += "&min_x=" + bounds.min_x + "&max_x=" + bounds.max_x + "&min_y=" + bounds.min_y + "&max_y=" + bounds.max_y;
     }
     const res = await fetch(url);
     const buf = await res.arrayBuffer();
