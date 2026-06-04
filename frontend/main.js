@@ -18,23 +18,16 @@ let currentEdges = undefined;
 
 async function initGraph() {
   try {
-    const configRes = await fetch(`/config?token=${token}`).then(r => r.json());
+    const configRes = await fetch(`/config?token=${token}`).then(async r => {
+        if (!r.ok) {
+            const text = await r.text();
+            throw new Error(text === "Unauthorized" ? "Invalid session token. Please ensure you are using the correct URL." : text);
+        }
+        return r.json();
+    });
     const userConfig = configRes.config || {};
     
-    const rawEdges = await fetch(`/data/edges?token=${token}`).then(r => r.json());
-    if (rawEdges && rawEdges.length > 0) {
-        currentEdges = new Float32Array(rawEdges.length * 2);
-        for (let i = 0; i < rawEdges.length; i++) {
-            currentEdges[i*2] = Number(rawEdges[i].source);
-            currentEdges[i*2+1] = Number(rawEdges[i].target);
-        }
-    } else if (rawEdges && rawEdges.source && rawEdges.target) {
-        currentEdges = new Float32Array(rawEdges.source.length * 2);
-        for (let i = 0; i < rawEdges.source.length; i++) {
-            currentEdges[i*2] = Number(rawEdges.source[i]);
-            currentEdges[i*2+1] = Number(rawEdges.target[i]);
-        }
-    }
+    // Edges are now fetched and parsed in the Web Worker for zero-copy transfer
 
     const worker = new Worker(new URL('./worker.js', import.meta.url), { type: 'module' });
 
@@ -44,10 +37,18 @@ async function initGraph() {
         return;
       }
 
-      const { count, positions, sizes, colors, ids } = e.data;
+      const { count, positions, sizes, colors, ids, edges } = e.data;
       loading.style.display = 'none';
+      
+      if (edges) {
+          currentEdges = edges;
+      }
 
       let useIds = ids && ids.some(val => val !== 0);
+
+      if (graph) {
+          try { graph.destroy(); } catch (e) { console.error("Error destroying graph:", e); }
+      }
 
       graph = new Graph(canvas, {
         pixelRatio: 1, 
@@ -63,10 +64,13 @@ async function initGraph() {
                tooltip.style.display = 'block';
                content.innerText = 'Loading DuckDB data for node ' + index + '...';
 
-               let queryParam = useIds ? 'id_val=' + ids[index] : 'id=' + index;
                if (!useIds) {
-                   console.warn("No 'id' column found in query. Using OFFSET index which may be non-deterministic.");
+                   console.warn("No 'id' column found in query. Click details disabled.");
+                   content.textContent = "Error: Click interactions on nodes require an explicit ID column in your query to prevent O(N) latency.";
+                   return;
                }
+
+               let queryParam = 'id_val=' + ids[index];
 
                fetch(`/node_details?${queryParam}&token=${token}`)
                  .then(async r => {
@@ -74,7 +78,7 @@ async function initGraph() {
                    return r.json();
                  }).then(data => {
                    if (!data || data.length === 0) {
-                       content.textContent = "Empty result! Node id:\n" + index;
+                       content.textContent = "Empty result! Node id:\n" + ids[index];
                    } else {
                        let text = JSON.stringify(data[0] || data, null, 2);
                        if (text.length > 1000) text = text.substring(0, 1000) + '\n\n... [TRUNCATED]';

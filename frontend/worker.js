@@ -36,12 +36,14 @@ self.onmessage = async (e) => {
       return;
     }
 
-    const dv = new DataView(buf);
-    const count = dv.getUint32(0, true);
+    const count = Math.floor(buf.byteLength / 20);
     if (count === 0) {
       self.postMessage({ count: 0 });
       return;
     }
+
+    const floatView = new Float32Array(buf);
+    const uintView = new Uint32Array(buf);
 
     const positions = new Float32Array(count * 2);
     const sizes = new Float32Array(count);
@@ -49,14 +51,15 @@ self.onmessage = async (e) => {
     const ids = new Uint32Array(count);
 
     // Simple fixed scaling to prevent points clamping to the bounds (The Fix from NotebookLM)
-    const finalScale = 40.0 * defaultScale;
+    const PHYSICS_LAYOUT_SCALE = 40.0;
+    const finalScale = PHYSICS_LAYOUT_SCALE * defaultScale;
 
     let minSize = Infinity, maxSize = -Infinity;
+    const rgbaCache = [];
 
     // First pass: Calculate bounds for dynamic node sizing only
     for (let i = 0; i < count; i++) {
-       const offset = 4 + (i * 20);
-       const s = dv.getFloat32(offset + 8, true);
+       const s = floatView[i * 5 + 2];
 
        if (s < minSize) minSize = s;
        if (s > maxSize) maxSize = s;
@@ -65,12 +68,11 @@ self.onmessage = async (e) => {
     const logMin = Math.log1p(Math.max(0, minSize));
     const logMax = Math.log1p(Math.max(0, maxSize));    // Second pass: Populate arrays
     for (let i = 0; i < count; i++) {
-      const offset = 4 + (i * 20);
-      const x = dv.getFloat32(offset, true);
-      const y = dv.getFloat32(offset + 4, true);
-      const s = dv.getFloat32(offset + 8, true);
-      const cat = Math.floor(dv.getFloat32(offset + 12, true));
-      const id = dv.getUint32(offset + 16, true);
+      const x = floatView[i * 5];
+      const y = floatView[i * 5 + 1];
+      const s = floatView[i * 5 + 2];
+      const cat = Math.floor(floatView[i * 5 + 3]);
+      const id = uintView[i * 5 + 4];
 
       positions[i * 2] = x * finalScale;
       positions[i * 2 + 1] = y * finalScale;
@@ -78,17 +80,41 @@ self.onmessage = async (e) => {
       let t = logMax > logMin ? (Math.log1p(Math.max(0, s)) - logMin) / (logMax - logMin) : 0;
       sizes[i] = config.minNodeSize || 1 + t * (config.maxNodeSize || 2);
 
-      const hex = getCategoryColor(cat);
-      const [r, g, b, a] = hexToRGBA(hex);
-      colors[i * 4] = r;
-      colors[i * 4 + 1] = g;
-      colors[i * 4 + 2] = b;
-      colors[i * 4 + 3] = a;
+      let rgba = rgbaCache[cat];
+      if (!rgba) {
+          const hex = getCategoryColor(cat);
+          rgba = hexToRGBA(hex);
+          rgbaCache[cat] = rgba;
+      }
+      colors[i * 4] = rgba[0];
+      colors[i * 4 + 1] = rgba[1];
+      colors[i * 4 + 2] = rgba[2];
+      colors[i * 4 + 3] = rgba[3];
 
       ids[i] = id;
     }
     
-    self.postMessage({ count, positions, sizes, colors, ids }, [positions.buffer, sizes.buffer, colors.buffer, ids.buffer]);
+    let edges = null;
+    try {
+        const edgeRes = await fetch(self.location.origin + `/data/edges_binary?token=${token}`);
+        if (edgeRes.ok) {
+            const edgeBuf = await edgeRes.arrayBuffer();
+            if (edgeBuf.byteLength >= 8) {
+                const edgeCount = Math.floor(edgeBuf.byteLength / 8);
+                if (edgeCount > 0) {
+                    edges = new Float32Array(edgeBuf);
+                }
+            }
+        }
+    } catch(err) {
+        console.error("Error fetching edges:", err);
+    }
+    
+    const transferables = [positions.buffer, sizes.buffer, colors.buffer, ids.buffer];
+    if (edges) {
+        transferables.push(edges.buffer);
+    }
+    self.postMessage({ count, positions, sizes, colors, ids, edges }, transferables);
   } catch(err) {
     self.postMessage({ error: err.message });
   }

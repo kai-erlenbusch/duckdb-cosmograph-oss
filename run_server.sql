@@ -14,4 +14,4 @@ SELECT
 FROM 'lmsys.parquet';
 
 -- 3. Launch the graph explorer with an optional Cosmograph configuration!
-SELECT serve_graph('my_graph_nodes', '{"simulationGravity": 0.5, "spaceSize": 4096, "backgroundColor": "#222222"}');
+SELECT * FROM serve_graph('my_graph_nodes', '{"simulationGravity": 0.5, "spaceSize": 4096, "backgroundColor": "#222222"}');
