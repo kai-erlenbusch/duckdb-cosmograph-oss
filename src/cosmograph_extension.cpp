@@ -306,7 +306,7 @@ inline void ServeGraphFun(DataChunk &args, ExpressionState &state, Vector &resul
         }
         g_server->Get(path, [kv](const httplib::Request &, httplib::Response &res) {
              res.set_content(reinterpret_cast<const char*>(kv.second.data), kv.second.size, kv.second.content_type);
-             res.set_header("Cache-Control", "public, max-age=31536000");
+             res.set_header("Cache-Control", "no-cache, no-store, must-revalidate");
         });
     }
 

@@ -47,36 +47,22 @@ self.onmessage = async (e) => {
     const colors = new Float32Array(count * 4);
     const ids = new Uint32Array(count);
 
-    let minSize = Infinity, maxSize = -Infinity;
-    let minX = Infinity, maxX = -Infinity, minY = Infinity, maxY = -Infinity;
+    // Simple fixed scaling to prevent points clamping to the bounds (The Fix from NotebookLM)
+    const finalScale = 40.0 * defaultScale;
 
-    // First pass: Calculate bounds for dynamic scaling
+    let minSize = Infinity, maxSize = -Infinity;
+
+    // First pass: Calculate bounds for dynamic node sizing only
     for (let i = 0; i < count; i++) {
        const offset = 4 + (i * 20);
-       const x = dv.getFloat32(offset, true);
-       const y = dv.getFloat32(offset + 4, true);
        const s = dv.getFloat32(offset + 8, true);
 
        if (s < minSize) minSize = s;
        if (s > maxSize) maxSize = s;
-       if (x < minX) minX = x;
-       if (x > maxX) maxX = x;
-       if (y < minY) minY = y;
-       if (y > maxY) maxY = y;
     }
 
     const logMin = Math.log1p(Math.max(0, minSize));
-    const logMax = Math.log1p(Math.max(0, maxSize));
-    
-    // Auto scale if they provided absolute coordinates
-    const rangeX = maxX - minX || 1;
-    const rangeY = maxY - minY || 1;
-    const spatialRange = Math.max(rangeX, rangeY);
-    // If the data is e.g. 0-1, we want to scale it to ~1000 so Cosmograph physics look good
-    const autoScale = (spatialRange > 0 && spatialRange < 10) ? (1000.0 / spatialRange) : 1.0;
-    const finalScale = autoScale * defaultScale;
-
-    // Second pass: Populate arrays
+    const logMax = Math.log1p(Math.max(0, maxSize));    // Second pass: Populate arrays
     for (let i = 0; i < count; i++) {
       const offset = 4 + (i * 20);
       const x = dv.getFloat32(offset, true);

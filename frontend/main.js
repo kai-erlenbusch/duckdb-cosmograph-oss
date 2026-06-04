@@ -6,13 +6,7 @@ const loading = document.getElementById('loading');
 let graph = null;
 let currentEdges = undefined;
 
-// Bypass luma.gl multiple version check
-let lumaVal;
-Object.defineProperty(globalThis, 'luma', {
-  get() { return undefined; },
-  set(v) { lumaVal = v; },
-  configurable: true
-});
+
 
 async function initGraph() {
   try {
@@ -81,7 +75,7 @@ async function initGraph() {
            }
         },
         ...userConfig,
-        simulationEnabled: false
+        enableSimulation: false
       });
       
       graph.setPointPositions(positions);
