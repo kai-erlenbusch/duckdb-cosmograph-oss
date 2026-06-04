@@ -6,6 +6,11 @@ const token = urlParams.get('token');
 const canvas = document.getElementById('app');
 const loading = document.getElementById('loading');
 
+if (!token) {
+    loading.innerText = 'Unauthorized: Missing session token. Please use the link printed in your DuckDB terminal (e.g. http://127.0.0.1:8080/?token=...).';
+    throw new Error('Missing session token');
+}
+
 let graph = null;
 let currentEdges = undefined;
 
